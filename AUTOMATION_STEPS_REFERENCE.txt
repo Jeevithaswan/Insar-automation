@@ -1,0 +1,142 @@
+====================================================================
+INSAR AUTOMATION PIPELINE -- STEP-BY-STEP REFERENCE
+====================================================================
+Keep this open while we test. Each stage below = one real, automated
+step. "Tool" = what's actually doing the work (same tools used
+manually on the Pettimudi project, just called by code now instead
+of by hand). "API used" = official external service being called
+programmatically, where applicable.
+
+--------------------------------------------------------------------
+STAGE 0 -- ENVIRONMENT PRECHECK
+--------------------------------------------------------------------
+Runs on every single run, for any AOI.
+Checks: conda environment active, all required Python packages
+importable, all required command-line tools on PATH, the two NumPy
+compatibility patches to ISCE2 are applied, enough free disk space,
+Earthdata (.netrc) and CDS (.cdsapirc) credential files present.
+Tool: custom Python checks (orchestrator/env.py)
+API used: none (local checks only)
+
+--------------------------------------------------------------------
+STAGE 1 -- SEARCH & DOWNLOAD SATELLITE SCENES
+--------------------------------------------------------------------
+Searches for Sentinel-1 satellite images covering your AOI/date
+range/track, then downloads them.
+Tool: asf_search (official NASA/ASF Python library)
+API used: NASA Alaska Satellite Facility (ASF) API
+Auth: ~/.netrc (Earthdata login), no manual login prompt
+
+--------------------------------------------------------------------
+STAGE 2 -- DEM (ELEVATION DATA) DOWNLOAD
+--------------------------------------------------------------------
+Fetches elevation data for your AOI, at the correct height datum
+(WGS84 ellipsoidal, not the geoid height that caused a real bug in
+an earlier separate project).
+Tool: dem_stitcher (Copernicus GLO-30) + ISCE2's gdal2isce_xml.py
+API used: Copernicus DEM data (via dem_stitcher)
+
+--------------------------------------------------------------------
+STAGE 3 -- ORBIT FILE DOWNLOAD
+--------------------------------------------------------------------
+Fetches precise satellite orbit correction files (needed for
+accurate geometry).
+Tool: sentineleof (installed package; CLI command is "eof")
+API used: ESA orbit data, via ASF's mirror
+
+--------------------------------------------------------------------
+STAGE 4 -- ISCE2 STACK SETUP
+--------------------------------------------------------------------
+Builds the interferogram network (which date pairs with which) and
+generates the 16 processing scripts (run_01 .. run_16) that Stage 5
+will execute. Also estimates roughly how much memory/time the heavy
+unwrapping step will need, for review.
+Tool: ISCE2's stackSentinel.py
+>>> GATE A HERE <<< -- pipeline stops, waits for human review of
+network settings (connections/looks) before the expensive stage runs.
+
+--------------------------------------------------------------------
+STAGE 5 -- ISCE2 STACK EXECUTION (the heavy part)
+--------------------------------------------------------------------
+Runs all 16 ISCE2 processing scripts in order:
+  run_01 unpack_topo_reference   <- full-resolution geometry, heaviest step
+  run_02 unpack_secondary_slc
+  run_03 average_baseline
+  run_04 extract_burst_overlaps
+  run_05 overlap_geo2rdr
+  run_06 overlap_resample
+  run_07 pairs_misreg
+  run_08 timeseries_misreg
+  run_09 fullBurst_geo2rdr
+  run_10 fullBurst_resample
+  run_11 extract_stack_valid_region
+  run_12 merge_reference_secondary_slc
+  run_13 generate_burst_igram
+  run_14 merge_burst_igram
+  run_15 filter_coherence
+  run_16 unwrap                  <- SNAPHU, memory-heavy, kept sequential by default
+Each individual line in each run file is checkpointed -- if
+interrupted, it resumes from the last completed line, not from zero.
+Tool: ISCE2 (same software used for Pettimudi)
+
+--------------------------------------------------------------------
+STAGE 6 -- MINTPY PREP + REFERENCE POINT CANDIDATES
+--------------------------------------------------------------------
+Loads the ISCE2 outputs into MintPy, computes coherence/reliability
+products, then runs the reference-point picker: finds candidate
+points (good coherence, elevation-matched, valid data) near the
+center of your AOI, automatically widening the search if nothing
+good is found nearby (this is what had to be done by hand once on
+Pettimudi -- now automatic).
+Tool: MintPy (load_data, modify_network steps) + custom picker logic
+>>> GATE B HERE <<< -- pipeline stops, waits for human to approve or
+override the suggested reference point before the actual deformation
+calculation runs.
+
+--------------------------------------------------------------------
+STAGE 7 -- MINTPY INVERSION
+--------------------------------------------------------------------
+Runs the actual SBAS deformation calculation using the approved
+reference point.
+Tool: MintPy's smallbaselineApp.py (same tool used for Pettimudi)
+
+--------------------------------------------------------------------
+STAGE 8 -- DELIVERABLES
+--------------------------------------------------------------------
+Generates the final outputs, cropped to your AOI:
+  - velocity_map.png            LOS deformation velocity map
+  - timeseries_by_date.png      cumulative displacement, one panel per date
+  - aoi_center_timeseries.png   displacement history at the AOI's center point
+  - whole_aoi_statistics.csv    numeric export
+  - velocity_overlay.kmz        Google Earth file
+Tool: custom Python (matplotlib/h5py, same libraries used for
+Pettimudi's figures)
+
+====================================================================
+THE TWO HUMAN CHECKPOINTS (the important safety feature)
+====================================================================
+Gate A (after Stage 4): review network design before the expensive
+  processing stage runs. Prevents the kind of memory crash (SNAPHU
+  OOM) that happened once on the original project.
+Gate B (after Stage 6): review/approve the reference point before
+  the deformation calculation runs. Prevents an automatically-picked
+  point from silently landing somewhere with no usable data (which
+  happened once on Pettimudi and had to be fixed by hand).
+
+====================================================================
+HOW TO RUN IT (once we've verified everything)
+====================================================================
+Dashboard:  open a browser to http://localhost:8501 after launching
+            (launch_insar_dashboard.ps1 on the Windows side)
+Headless:   python -m orchestrator.cli run --config <path>.yaml
+            python -m orchestrator.cli approve-gate-a --run-id <id>
+            python -m orchestrator.cli approve-gate-b --run-id <id> --lat <lat> --lon <lon>
+            python -m orchestrator.cli status --run-id <id>
+
+====================================================================
+CURRENT STATUS (as of this test cycle)
+====================================================================
+[DONE + PROVEN]   Stages 0-4, Gate A, checkpoint/resume, dashboard launch
+[NOT YET PROVEN]  Stage 5 (got stuck ~4hrs on run_01 in the last test,
+                  restarting fresh to investigate), Stage 6, Gate B,
+                  Stage 7, Stage 8

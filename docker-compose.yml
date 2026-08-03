@@ -1,0 +1,18 @@
+services:
+  insar:
+    build: .
+    image: insar-pipeline
+    ports:
+      - "8501:8501"
+    volumes:
+      # Run data (downloaded scenes, DEM, ISCE2/MintPy outputs, final
+      # deliverables) persists on the host, not trapped inside the
+      # container -- deleting/rebuilding the container never loses results.
+      - ./docker_runs:/root/insar-automation/runs
+      # ASF (.netrc) and CDS (.cdsapirc) credentials -- bind-mounted as
+      # individual files (not the whole home dir) so they survive a
+      # container rebuild, entered once via the dashboard's Credentials
+      # Configuration page or created manually before first run:
+      #   touch ./docker_credentials/.netrc ./docker_credentials/.cdsapirc
+      - ./docker_credentials/.netrc:/root/.netrc
+      - ./docker_credentials/.cdsapirc:/root/.cdsapirc

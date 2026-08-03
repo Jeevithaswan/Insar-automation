@@ -1,0 +1,39 @@
+run_id: pettimudi_repro
+# Controlled comparison test, NOT a genericity test: reuses Pettimudi's own
+# known-good scene/AOI/track through the NEW automated pipeline (instead of
+# the original manual terminal commands) to isolate one variable -- does the
+# automation layer itself add meaningful overhead versus the proven manual
+# run (18 bursts in ~18 min)? SLC/orbit files are reused from
+# ~/pettimudi_insar/ (pre-copied into this run's slc/ and orbits/ folders)
+# to skip re-downloading ~8GB and get straight to the comparison.
+aoi:
+  bbox: [76.861306, 10.021694, 77.161306, 10.321694]   # exact Pettimudi bbox
+date_range:
+  start: "2020-03-19"
+  end: "2020-05-18"
+sentinel1:
+  relative_orbit: 165        # confirmed via asf_search for this exact scene
+  flight_direction: DESCENDING
+  polarization: VV
+dem:
+  source: glo_30
+  padding_deg: 1.0            # new corrected default
+network:
+  connections: 1
+  azimuth_looks: 7
+  range_looks: 19
+  run16_parallelism: 1
+  num_proc: 1
+  num_proc4topo: 1
+mintpy:
+  reference_lalo: null
+  reference_search_radius_km: 5.0
+  reliability_threshold: 0.5
+  unwrap_error_method: "bridging+phase_closure"
+  deramp: linear
+  tropo_enabled: false
+  tropo_method: pyaps
+  tropo_weather_model: ERA5
+  topographic_residual: true
+output:
+  base_dir: "~/insar-automation/runs"

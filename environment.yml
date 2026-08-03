@@ -1,0 +1,25 @@
+# Pinned to the exact versions verified working in this project's live
+# testing -- not a guess. Exported from the real 'insar' conda environment.
+name: insar
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.13
+  - isce2=2.6.5
+  - mintpy=1.6.4
+  - gdal=3.10.3
+  - h5py=3.16.0
+  - pyaps3=0.3.7
+  - cdsapi=0.7.7
+  - asf_search=12.2.3
+  - psutil=7.2.2
+  - pyyaml=6.0.3
+  - pip
+  - pip:
+    - dem_stitcher==2.5.13
+    - rasterio==1.5.0
+    - sentineleof==0.13.0
+    - streamlit==1.60.0
+    - pydantic==2.13.4
+    - folium==0.20.0
+    - streamlit-folium==0.27.3

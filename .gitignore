@@ -1,0 +1,8 @@
+/runs/
+docker_runs/
+docker_credentials/
+__pycache__/
+*.pyc
+isce.log
+~$*.docx
+.streamlit/
