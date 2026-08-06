@@ -1,18 +1,19 @@
+# Usage:
+#   docker compose run --rm insar tracks configs/runs/dummy_test_aoi.yaml
+#   docker compose run --rm insar 0
+#   docker compose run --rm insar 1
+#   docker compose run --rm insar 7 36.10022 -119.44996
+#   ...same stage numbers/args as running pipeline.py directly.
+#
+# Credentials (~/.netrc, ~/.cdsapirc) are mounted read-only from your own
+# home directory -- never baked into the image, never committed to the repo.
+
 services:
   insar:
     build: .
     image: insar-pipeline
-    ports:
-      - "8501:8501"
     volumes:
-      # Run data (downloaded scenes, DEM, ISCE2/MintPy outputs, final
-      # deliverables) persists on the host, not trapped inside the
-      # container -- deleting/rebuilding the container never loses results.
-      - ./docker_runs:/root/insar-automation/runs
-      # ASF (.netrc) and CDS (.cdsapirc) credentials -- bind-mounted as
-      # individual files (not the whole home dir) so they survive a
-      # container rebuild, entered once via the dashboard's Credentials
-      # Configuration page or created manually before first run:
-      #   touch ./docker_credentials/.netrc ./docker_credentials/.cdsapirc
-      - ./docker_credentials/.netrc:/root/.netrc
-      - ./docker_credentials/.cdsapirc:/root/.cdsapirc
+      - ${HOME}/.netrc:/root/.netrc:ro
+      - ${HOME}/.cdsapirc:/root/.cdsapirc:ro
+      - ./runs:/root/insar-automation/runs
+      - ./configs:/root/insar-automation/configs

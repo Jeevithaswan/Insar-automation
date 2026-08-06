@@ -24,11 +24,27 @@ network:
   run16_parallelism: 1
   num_proc: 1              # testing hypothesis: matches Pettimudi's proven serial settings
   num_proc4topo: 1          # (was 2/2 -- possible cause of the run_01 slowness)
+  # this dev laptop is a hybrid 6 performance-core + 4 efficiency-core CPU;
+  # confining ISCE2's internal OpenMP threading to the 6 fast cores tested
+  # faster and fully-utilized (587% CPU across 6 threads) vs letting it
+  # spread across all 16 (fast+slow) threads. host-specific -- remove/raise
+  # this on uniform-core hardware (e.g. a cloud VM).
+  topo_omp_threads: 6
+# ISCE2's own docs: recommended for low-latitude/ascending data, but "only
+# works well in areas with high coherence" -- no universal on/off answer,
+# so check stage 6's printed coherence readout for THIS AOI before enabling.
+ionosphere:
+  enabled: false
+  num_connections_ion: 3
 mintpy:
   reference_lalo: null
   reference_search_radius_km: 5.0
   reliability_threshold: 0.5
-  unwrap_error_method: "bridging+phase_closure"
+  # phase_closure needs >=3 interferograms forming a closed time triangle --
+  # impossible with this AOI's 2 scenes / 1 pair, so "bridging" only here.
+  # (real configs with enough scenes for triangles should keep
+  # "bridging+phase_closure", e.g. pettimudi_repro.yaml)
+  unwrap_error_method: "bridging"
   deramp: linear
   tropo_enabled: false     # tests plumbing, not the CDS credential path
   tropo_method: pyaps

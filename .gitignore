@@ -1,8 +1,13 @@
-/runs/
-docker_runs/
-docker_credentials/
+# Run outputs -- large, regenerable by re-running the pipeline, never committed
+runs/
+
+# Logs
+isce.log
+*.log
+
+# Python
 __pycache__/
 *.pyc
-isce.log
-~$*.docx
-.streamlit/
+
+# Editor/tooling
+.vscode/

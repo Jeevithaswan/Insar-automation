@@ -1,7 +1,6 @@
+.git
 runs/
-docker_runs/
-docker_credentials/
-**/__pycache__/
+__pycache__/
 *.pyc
 isce.log
-.git/
+.vscode/
