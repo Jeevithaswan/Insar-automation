@@ -329,9 +329,50 @@ def stage0_env_precheck(cfg: dict, paths: Paths) -> None:
     free_gb = free / (1024 ** 3)
     checks.append({"check": "disk_space", "ok": free_gb >= 20.0, "detail": f"{free_gb:.1f} GB free (need >= 20 GB)"})
 
-    netrc_ok = os.path.exists(os.path.expanduser("~/.netrc"))
-    checks.append({"check": "earthdata_netrc", "ok": netrc_ok,
-                    "detail": "present" if netrc_ok else "~/.netrc MISSING -- needed for ASF download"})
+    # Stronger than "file exists" -- actually parses it and confirms the
+    # specific host ASF authentication needs is present with a non-empty
+    # login/password. Confirmed by direct testing that a malformed netrc
+    # (wrong host, empty password from a bad manual edit) still passes a
+    # bare os.path.exists check and only fails later, deep in stage 1's
+    # download loop, which is a much more confusing place to discover it.
+    # Run `python pipeline.py setup-credentials` to write this file correctly.
+    netrc_detail = "not checked"
+    netrc_ok = False
+    netrc_path = os.path.expanduser("~/.netrc")
+    if not os.path.exists(netrc_path):
+        netrc_detail = "~/.netrc MISSING -- run `python pipeline.py setup-credentials`"
+    else:
+        try:
+            import netrc as netrc_module
+            parsed = netrc_module.netrc(netrc_path)
+            entry = parsed.authenticators("urs.earthdata.nasa.gov")
+            if entry is None:
+                netrc_detail = "~/.netrc exists but has no 'urs.earthdata.nasa.gov' entry"
+            elif not entry[0] or not entry[2]:
+                netrc_detail = "~/.netrc has a urs.earthdata.nasa.gov entry but login/password is empty"
+            else:
+                netrc_ok = True
+                netrc_detail = f"present, valid entry for urs.earthdata.nasa.gov (login={entry[0]})"
+        except Exception as e:
+            netrc_detail = f"~/.netrc exists but failed to parse: {e}"
+    checks.append({"check": "earthdata_netrc", "ok": netrc_ok, "detail": netrc_detail})
+
+    # Only required if this run actually needs it -- don't hard-fail every
+    # AOI over a credential that's only exercised when tropo_enabled=true.
+    if cfg.get("mintpy", {}).get("tropo_enabled"):
+        cdsapirc_path = os.path.expanduser("~/.cdsapirc")
+        cds_ok, cds_detail = False, "not checked"
+        if not os.path.exists(cdsapirc_path):
+            cds_detail = "~/.cdsapirc MISSING (needed because mintpy.tropo_enabled=true) -- run `python pipeline.py setup-credentials`"
+        else:
+            text = Path(cdsapirc_path).read_text()
+            has_url = re.search(r"^url:\s*\S+", text, re.MULTILINE) is not None
+            has_key = re.search(r"^key:\s*\S+", text, re.MULTILINE) is not None
+            if has_url and has_key:
+                cds_ok, cds_detail = True, "present, has url and key fields"
+            else:
+                cds_detail = "~/.cdsapirc exists but missing 'url:' and/or 'key:' field"
+        checks.append({"check": "cds_api_cdsapirc", "ok": cds_ok, "detail": cds_detail})
 
     for c in checks:
         print(f"  [{'OK' if c['ok'] else 'FAIL'}] {c['check']}: {c['detail']}")
@@ -492,24 +533,53 @@ def _search_slc_scenes(cfg: dict, orbit_override: int | None = None,
         s1 = {**s1, "relative_orbit": orbit_override}
     if direction_override is not None:
         s1 = {**s1, "flight_direction": direction_override}
-    if s1.get("relative_orbit") is None or s1.get("flight_direction") is None:
-        raise ValueError(
-            "sentinel1.relative_orbit and sentinel1.flight_direction must be set, either in the "
-            "config or via --orbit/--direction -- run `python pipeline.py tracks` first to find "
-            "which tracks cover this AOI."
-        )
 
     wkt = _bbox_to_wkt(cfg["aoi"]["bbox"])
-    results = asf.geo_search(
-        platform=asf.PLATFORM.SENTINEL1,
-        intersectsWith=wkt,
-        start=cfg["date_range"]["start"],
-        end=cfg["date_range"]["end"],
-        processingLevel=asf.PRODUCT_TYPE.SLC,
-        beamMode=asf.BEAMMODE.IW,
-        relativeOrbit=s1["relative_orbit"],
-        flightDirection=s1["flight_direction"],
-    )
+
+    if s1.get("relative_orbit") is None or s1.get("flight_direction") is None:
+        # No track pinned (config left it null, no --orbit/--direction) --
+        # auto-pick instead of hard-failing. Ascending vs. descending is a
+        # real scientific decision (different deformation sensitivity
+        # direction), so this can't be silently invisible -- it prints
+        # exactly which track it picked and why, and how to override it,
+        # same "surfaced, not hidden" spirit as `tracks`, just defaulted
+        # instead of mandatory. Scoring: most scenes covering the AOI/date
+        # range wins (more dates = a better SBAS time series), ties broken
+        # by earliest start date.
+        broad = asf.geo_search(
+            platform=asf.PLATFORM.SENTINEL1, intersectsWith=wkt,
+            start=cfg["date_range"]["start"], end=cfg["date_range"]["end"],
+            processingLevel=asf.PRODUCT_TYPE.SLC, beamMode=asf.BEAMMODE.IW,
+        )
+        if not broad:
+            raise RuntimeError("No Sentinel-1 IW SLC scenes found at all for this AOI/date range.")
+        by_track: dict[tuple, list] = {}
+        for r in broad:
+            by_track.setdefault((r.properties.get("pathNumber"), r.properties.get("flightDirection")), []).append(r)
+        (best_orbit, best_direction), best_scenes = sorted(
+            by_track.items(),
+            key=lambda kv: (-len(kv[1]), min(s.properties.get("startTime") or "9999" for s in kv[1])),
+        )[0]
+        print(f"No track specified -- auto-selected relative_orbit={best_orbit} "
+              f"flight_direction={best_direction} ({len(best_scenes)} scene(s), "
+              f"most of the {len(by_track)} track(s) covering this AOI/date range).")
+        if len(by_track) > 1:
+            print(f"  {len(by_track) - 1} other track(s) also cover this AOI -- if look direction matters for "
+                  f"your analysis (e.g. a slope facing one way), review them with `python pipeline.py tracks` "
+                  f"and override via --orbit/--direction.")
+        s1 = {**s1, "relative_orbit": best_orbit, "flight_direction": best_direction}
+        results = best_scenes
+    else:
+        results = asf.geo_search(
+            platform=asf.PLATFORM.SENTINEL1,
+            intersectsWith=wkt,
+            start=cfg["date_range"]["start"],
+            end=cfg["date_range"]["end"],
+            processingLevel=asf.PRODUCT_TYPE.SLC,
+            beamMode=asf.BEAMMODE.IW,
+            relativeOrbit=s1["relative_orbit"],
+            flightDirection=s1["flight_direction"],
+        )
     if not results:
         raise RuntimeError(f"No scenes found for orbit={s1['relative_orbit']} direction={s1['flight_direction']}")
 
@@ -714,12 +784,29 @@ def _estimate_network_cost(cfg: dict, num_scenes: int) -> dict:
     est_pixels = max(1, range_px) * max(1, azimuth_px)
     est_snaphu_mb = max(200, (est_pixels / 1_000_000) * 2000)
 
+    # Rough wall-clock RANGE for the unwrap step (run_16, usually the
+    # dominant cost of the whole stage), not a precise prediction --
+    # per-pair unwrap time is dominated by coherence, which you can't know
+    # until the AOI's actual data exists, and this project has directly
+    # measured a ~10x swing on the SAME 9-pair network (Pettimudi,
+    # 2026-08-10): ~10 min/pair on a comparatively better-behaved DEM vs.
+    # ~115 min/pair on a mismatched one that left more low-coherence
+    # unwrapping ambiguity for SNAPHU to resolve. Both ends of that
+    # observed range are used here rather than a single guessed number, on
+    # a currently sequential run16_parallelism=1 assumption (multiply down
+    # if you've confirmed spare RAM for more parallel instances).
+    low_min_per_pair, high_min_per_pair = 10, 115
+    est_unwrap_hours_low = (approx_pairs * low_min_per_pair) / 60 / net["run16_parallelism"]
+    est_unwrap_hours_high = (approx_pairs * high_min_per_pair) / 60 / net["run16_parallelism"]
+
     return {
         "num_scenes": num_scenes,
         "approx_interferogram_pairs": approx_pairs,
         "approx_pixels_after_multilook": int(est_pixels),
         "approx_snaphu_mb_per_instance": round(est_snaphu_mb),
         "approx_snaphu_peak_mb": round(est_snaphu_mb * net["run16_parallelism"]),
+        "approx_unwrap_hours_range": f"{est_unwrap_hours_low:.1f}-{est_unwrap_hours_high:.1f} "
+                                      f"(rough, coherence-dependent -- see comment in _estimate_network_cost)",
     }
 
 
@@ -788,6 +875,70 @@ def stage4_stack_setup(cfg: dict, paths: Paths) -> dict:
 # ============================================================
 # STAGE 5 -- execute ISCE2's run_01..run_NN (the heavy preprocessing step)
 # ============================================================
+def _plot_sbas_network(stack_proc: Path, out_path: Path) -> Path | None:
+    """Perpendicular-baseline-vs-date network plot -- lets you sanity-check
+    the SBAS network's shape (pair count, date spread, any oddly-long
+    baselines) right after run_03_average_baseline, which is early and cheap,
+    well before the expensive unwrap step (run_16) that this pipeline has
+    seen take anywhere from ~90 minutes to ~17 hours depending on coherence.
+    Needs baselines/ (from run_03) and configs/ (already written by stage 4's
+    stackSentinel.py call, before any run_files execute) -- so this can in
+    principle run as soon as run_03 finishes, without waiting on anything
+    after it."""
+    baseline_dirs = sorted((stack_proc / "baselines").glob("*_*"))
+    pair_configs = list((stack_proc / "configs").glob("config_generate_igram_*"))
+    if not baseline_dirs or not pair_configs:
+        return None
+
+    # every baseline dir is named "<reference>_<date>" -- reference is the
+    # common prefix, and sits at Bperp=0 by definition (baseline to itself)
+    ref_date = baseline_dirs[0].name.split("_")[0]
+    bperp = {ref_date: 0.0}
+    for d in baseline_dirs:
+        date = d.name.split("_", 1)[1]
+        txts = list(d.glob("*.txt"))
+        if not txts:
+            continue
+        vals = [float(m.group(1)) for m in
+                re.finditer(r"Bperp \(average\):\s*(-?[\d.]+)", txts[0].read_text())]
+        if vals:
+            bperp[date] = sum(vals) / len(vals)
+
+    pairs = []
+    for f in pair_configs:
+        m = re.match(r"config_generate_igram_(\d{8})_(\d{8})", f.name)
+        if m:
+            pairs.append((m.group(1), m.group(2)))
+    if not bperp or not pairs:
+        return None
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from datetime import datetime
+
+    dates_sorted = sorted(bperp)
+    x = {d: datetime.strptime(d, "%Y%m%d") for d in dates_sorted}
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for d1, d2 in pairs:
+        if d1 in bperp and d2 in bperp:
+            ax.plot([x[d1], x[d2]], [bperp[d1], bperp[d2]], "-", color="steelblue", alpha=0.6, zorder=1)
+    ax.scatter([x[d] for d in dates_sorted], [bperp[d] for d in dates_sorted],
+               color="darkred", zorder=2, s=40)
+    for d in dates_sorted:
+        ax.annotate(d, (x[d], bperp[d]), textcoords="offset points", xytext=(4, 4), fontsize=8)
+    ax.set_xlabel("Date"); ax.set_ylabel("Perpendicular baseline (m)")
+    ax.set_title(f"SBAS network -- {len(pairs)} pair(s), {len(dates_sorted)} date(s)")
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
 def _natural_key(path: Path):
     m = re.match(r"run_(\d+)", path.name)
     return int(m.group(1)) if m else 0
@@ -879,6 +1030,16 @@ def stage5_stack_execute(cfg: dict, paths: Paths) -> None:
         _execute_run_file(paths.run_dir, run_file, parallelism, net.get("topo_omp_threads"))
         mark_done(paths.run_dir, stage_marker)
         print(f"Finished {run_file.name}")
+
+        # As early as possible, not after the whole stage -- baselines/ only
+        # exists once run_03 has actually executed (stage 4 alone doesn't
+        # populate it), but that's still early and cheap, well before the
+        # expensive unwrap step this plot exists to let you sanity-check
+        # ahead of.
+        if "average_baseline" in run_file.name.lower():
+            net_plot = _plot_sbas_network(paths.stack_proc, paths.review / "sbas_network.png")
+            if net_plot:
+                print(f"SBAS network plot (sanity-check before the expensive unwrap step): {net_plot}")
 
     print("stack_execute complete.")
 
@@ -1246,6 +1407,95 @@ def stage8_deliverables(cfg: dict, paths: Paths) -> dict:
 # ============================================================
 # entrypoint
 # ============================================================
+def setup_credentials() -> None:
+    """Interactive one-time setup for the two credential files this
+    pipeline needs -- writes them in the exact format/permissions each
+    tool expects, instead of requiring you to know that format yourself.
+    Run standalone: python pipeline.py setup-credentials"""
+    import getpass
+
+    print("=== Earthdata login (required -- ASF Sentinel-1 downloads) ===")
+    print("Don't have one? Register free at https://urs.earthdata.nasa.gov/users/new")
+    netrc_file = Path(os.path.expanduser("~/.netrc"))
+    do_netrc = True
+    if netrc_file.exists():
+        print(f"{netrc_file} already exists.")
+        do_netrc = input("Overwrite it? [y/N]: ").strip().lower() == "y"
+    if do_netrc:
+        username = input("Earthdata username: ").strip()
+        password = getpass.getpass("Earthdata password (hidden as you type): ")
+        if username and password:
+            print(f"About to write to {netrc_file}:")
+            print(f"  machine urs.earthdata.nasa.gov")
+            print(f"  login {username}")
+            print(f"  password {'*' * len(password)}  (hidden, {len(password)} characters)")
+            if input("Write this? [y/N]: ").strip().lower() == "y":
+                content = f"machine urs.earthdata.nasa.gov\n    login {username}\n    password {password}\n"
+                netrc_file.write_text(content)
+                netrc_file.chmod(0o600)  # required by convention -- many tools refuse a world-readable netrc
+                print(f"Wrote {netrc_file} (permissions set to 600).")
+            else:
+                print("Cancelled -- nothing written.")
+        else:
+            print("Skipped (empty username or password).")
+    else:
+        print("Skipped.")
+
+    print()
+    print("=== CDS API key (optional -- only needed if mintpy.tropo_enabled: true) ===")
+    cdsapirc_file = Path(os.path.expanduser("~/.cdsapirc"))
+    do_cds = True
+    if cdsapirc_file.exists():
+        print(f"{cdsapirc_file} already exists.")
+        do_cds = input("Overwrite it? [y/N]: ").strip().lower() == "y"
+    else:
+        do_cds = input("Set this up now? [y/N]: ").strip().lower() == "y"
+    if do_cds:
+        print("Don't have a key? Register free at https://cds.climate.copernicus.eu/ , then find")
+        print("your key at https://cds.climate.copernicus.eu/profile")
+        # Confirmed by direct testing (2026-08-11): a prior version of this
+        # prompt accepted ANY typed text as the URL, including "n" (meant as
+        # "no" by someone reading it the same way as the y/N prompts above
+        # it) -- silently corrupted a real, previously-working ~/.cdsapirc
+        # with url=n. Now validates it looks like a URL and re-asks instead
+        # of accepting garbage.
+        default_url = "https://cds.climate.copernicus.eu/api"
+        while True:
+            url = input(f"CDS API URL [press Enter for default: {default_url}]: ").strip() or default_url
+            if url.startswith("http://") or url.startswith("https://"):
+                break
+            print(f"  That doesn't look like a URL (must start with http:// or https://) -- try again, "
+                  f"or just press Enter for the default.")
+        # Same reasoning -- reject obviously-not-a-real-key input (typo'd
+        # "n"/"y"/"no"/"yes", or empty) instead of silently writing it.
+        while True:
+            key = getpass.getpass("CDS API key (hidden as you type): ").strip()
+            if not key:
+                print("  Empty -- skipping CDS setup.")
+                key = None
+                break
+            if key.lower() in ("n", "no", "y", "yes") or len(key) < 8:
+                print(f"  '{key}' doesn't look like a real CDS API key (too short / looks like a "
+                      f"yes-or-no answer) -- try again, or Ctrl+C to abort.")
+                continue
+            break
+        if key:
+            print(f"About to write to {cdsapirc_file}:")
+            print(f"  url: {url}")
+            print(f"  key: {'*' * len(key)}  (hidden, {len(key)} characters)")
+            if input("Write this? [y/N]: ").strip().lower() == "y":
+                cdsapirc_file.write_text(f"url: {url}\nkey: {key}\n")
+                cdsapirc_file.chmod(0o600)
+                print(f"Wrote {cdsapirc_file} (permissions set to 600).")
+            else:
+                print("Cancelled -- nothing written.")
+    else:
+        print("Skipped.")
+
+    print()
+    print("Run `python pipeline.py 0 <config_yaml>` to verify these are read correctly.")
+
+
 STAGES = {
     "0": stage0_env_precheck,
     "1": stage1_search_download,
@@ -1259,14 +1509,16 @@ STAGES = {
 }
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or (sys.argv[1] not in STAGES and sys.argv[1] != "tracks"):
+    if len(sys.argv) < 2 or sys.argv[1] not in (*STAGES, "tracks", "setup-credentials"):
         print(__doc__)
         sys.exit(1)
 
     stage_key = sys.argv[1]
     extra_args = sys.argv[2:]
 
-    if stage_key == "tracks":
+    if stage_key == "setup-credentials":
+        setup_credentials()
+    elif stage_key == "tracks":
         config_path = extra_args[0] if extra_args else None
         cfg, paths = setup(config_path)
         search_tracks(cfg, paths)
