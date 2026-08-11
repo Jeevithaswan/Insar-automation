@@ -1,5 +1,9 @@
-# Run outputs -- large, regenerable by re-running the pipeline, never committed
-runs/
+# Run outputs -- large, regenerable by re-running the pipeline, never committed.
+# Leading slash matters: anchors this to the repo root only -- without it,
+# this pattern also silently matched configs/runs/ (confirmed 2026-08-10:
+# template.yaml and docker_test.yaml were never actually tracked by git
+# since the very first commit because of this, despite being intended to be).
+/runs/
 
 # Logs
 isce.log

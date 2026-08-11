@@ -1,0 +1,48 @@
+run_id: docker_test
+aoi:
+  bbox: [-119.5, 36.09, -119.4, 36.11]   # shrunk to hit a single burst -- pure plumbing test, not a real analysis
+date_range:
+  start: "2020-06-01"
+  end: "2020-06-10"
+sentinel1:
+  relative_orbit: 144
+  flight_direction: DESCENDING
+  polarization: VV
+dem:
+  source: glo_30
+  # 0.1 was far too small: ISCE2's topo step needs a DEM covering the full
+  # sensor swath footprint, not just the output AOI -- confirmed by comparing
+  # to the Pettimudi run (DEM padded ~0.75 deg beyond its own bbox, topo
+  # finished 18 bursts in ~18 min) vs this AOI's own topo log, which reported
+  # needing ~0.7 deg lon / ~0.32 deg lat beyond the bbox and never finished
+  # burst 1 in 20+ min at padding_deg=0.1.
+  padding_deg: 1.0
+network:
+  connections: 1          # minimal test: 2 scenes -> 1 pair, to isolate/investigate run_01 timing first
+  azimuth_looks: 7
+  range_looks: 19
+  run16_parallelism: 1
+  num_proc: 1              # testing hypothesis: matches Pettimudi's proven serial settings
+  num_proc4topo: 1          # (was 2/2 -- possible cause of the run_01 slowness)
+  # this dev laptop is a hybrid 6 performance-core + 4 efficiency-core CPU;
+  # confining ISCE2's internal OpenMP threading to the 6 fast cores tested
+  # faster and fully-utilized (587% CPU across 6 threads) vs letting it
+  # spread across all 16 (fast+slow) threads. host-specific -- remove/raise
+  # this on uniform-core hardware (e.g. a cloud VM).
+  topo_omp_threads: 6
+mintpy:
+  reference_lalo: null
+  reference_search_radius_km: 5.0
+  reliability_threshold: 0.5
+  # phase_closure needs >=3 interferograms forming a closed time triangle --
+  # impossible with this AOI's 2 scenes / 1 pair, so "bridging" only here.
+  # (real configs with enough scenes for triangles should keep
+  # "bridging+phase_closure", e.g. pettimudi_repro.yaml)
+  unwrap_error_method: "bridging"
+  deramp: linear
+  tropo_enabled: false     # tests plumbing, not the CDS credential path
+  tropo_method: pyaps
+  tropo_weather_model: ERA5
+  topographic_residual: true
+output:
+  base_dir: "~/insar-automation/runs"

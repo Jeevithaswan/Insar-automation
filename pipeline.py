@@ -9,8 +9,12 @@ from code instead of by hand, so it works for any AOI/date range/track.
 HOW TO RUN (VS Code terminal or any terminal):
     conda activate insar
     python pipeline.py tracks               find which Sentinel-1 tracks cover a NEW AOI (run this first for a new region)
+                                             -- prints each track + writes review/footprint_map.png (AOI + one color per track)
     python pipeline.py 0                    env precheck
     python pipeline.py 1                    search + download SLCs
+                                             -- add --orbit <N> --direction <ASCENDING|DESCENDING> to pick a track from
+                                                `tracks` output without editing the config (falls back to sentinel1.* in the
+                                                config if omitted)
     python pipeline.py 2                    DEM
     python pipeline.py 3                    orbit files
     python pipeline.py 4                    ISCE2 stackSentinel.py setup (generates run_01..run_NN)
@@ -350,13 +354,18 @@ def _bbox_to_wkt(bbox: list[float]) -> str:
 #   python pipeline.py tracks [config_yaml]
 # Only needs aoi.bbox + date_range set (sentinel1.relative_orbit/
 # flight_direction not required yet -- that's what this finds). Prints
-# every available track with its scene count so you can pick one and fill
-# it into the config yourself -- same "pipeline surfaces the options, you
-# make the call" pattern as reference-point selection (stage 6/7), since
-# ascending vs. descending changes which deformation direction you're
-# sensitive to, not something to silently auto-pick.
+# every available track with its scene count, AND draws an ASF-Vertex-style
+# footprint map (AOI bbox + one color per track) to review/footprint_map.png
+# so you can see coverage geographically instead of just reading scene
+# names. Still just SURFACES the options rather than auto-picking one --
+# same "pipeline surfaces the options, you make the call" pattern as
+# reference-point selection (stage 6/7), since ascending vs. descending
+# changes which deformation direction you're sensitive to, not something to
+# silently auto-pick. You choose by passing --orbit/--direction to stage 1
+# (see its usage message), same as stage 7 takes its reference point as a
+# CLI arg rather than something written back into the config file.
 # ============================================================
-def search_tracks(cfg: dict) -> list[dict]:
+def search_tracks(cfg: dict, paths: Paths | None = None) -> list[dict]:
     import asf_search as asf
 
     wkt = _bbox_to_wkt(cfg["aoi"]["bbox"])
@@ -398,24 +407,96 @@ def search_tracks(cfg: dict) -> list[dict]:
                   f"pol={p.get('polarization')}  {size_mb:.0f} MB")
         print()
 
-    print("Pick a track above, then set sentinel1.relative_orbit / flight_direction in your config YAML to match it.")
+    map_path = _plot_track_footprints(cfg, tracks, paths)
+    if map_path:
+        print(f"Footprint map (AOI + one color per track): {map_path}")
+
+    print("Pick a track above, then run stage 1 with --orbit/--direction to match it, e.g.:")
+    print("    python pipeline.py 1 <config_yaml> --orbit <relative_orbit> --direction <flight_direction>")
+    print("(sentinel1.relative_orbit/flight_direction in the config are only used as a fallback default")
+    print("if you don't pass these flags.)")
     print("Stage 1 downloads every scene listed under whichever track you pick -- for SBAS, more dates on the")
     print("same track generally means a better time series, so there's usually no reason to drop individual dates.")
-    print("If you do need to exclude a specific date, note it now and we can add that -- not built in yet.")
+    print("If you do need to exclude a specific date, use sentinel1.exclude_dates in the config.")
     return summary
+
+
+def _plot_track_footprints(cfg: dict, tracks: dict[tuple, list], paths: Paths | None) -> Path | None:
+    """ASF-Vertex-style static map: AOI bbox + each track's scene footprints
+    in its own color. Plain lon/lat plot (no basemap tiles/cartopy) -- same
+    simplified-coverage view Vertex's map gives you, without a new
+    dependency (matplotlib is already used by stage 8)."""
+    if paths is None:
+        return None
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon as MplPolygon, Rectangle
+
+    fig, ax = plt.subplots(figsize=(9, 8))
+    colors = plt.get_cmap("tab10")
+
+    for i, ((orbit, direction), scenes) in enumerate(sorted(tracks.items(), key=lambda kv: -len(kv[1]))):
+        color = colors(i % 10)
+        for j, s in enumerate(scenes):
+            geom = s.geometry or {}
+            coords = geom.get("coordinates") or []
+            rings = coords if geom.get("type") == "MultiPolygon" else [coords]
+            for ring_set in rings:
+                if not ring_set:
+                    continue
+                outer_ring = ring_set[0]
+                ax.add_patch(MplPolygon(outer_ring, closed=True, fill=False,
+                                         edgecolor=color, linewidth=1.2, alpha=0.8,
+                                         label=f"orbit={orbit} {direction}" if j == 0 else None))
+
+    lon_min, lat_min, lon_max, lat_max = cfg["aoi"]["bbox"]
+    ax.add_patch(Rectangle((lon_min, lat_min), lon_max - lon_min, lat_max - lat_min,
+                            fill=False, edgecolor="black", linewidth=2.0, linestyle="--",
+                            label="AOI"))
+
+    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+    ax.set_title(f"Sentinel-1 track coverage -- {cfg.get('run_id', '')}")
+    ax.autoscale_view()
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    paths.review.mkdir(parents=True, exist_ok=True)
+    out_path = paths.review / "footprint_map.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 # ============================================================
 # STAGE 1 -- search + download Sentinel-1 SLC scenes (ASF)
 # ============================================================
-def stage1_search_download(cfg: dict, paths: Paths) -> list[str]:
+def _search_slc_scenes(cfg: dict, orbit_override: int | None = None,
+                        direction_override: str | None = None) -> list:
+    """ASF search + filter for exactly the scenes a run will use -- shared by
+    stage1 (to download them) and stage2 (to derive the DEM extent from
+    their real footprint geometry, instead of guessing a symmetric AOI pad).
+    Both stages must see the IDENTICAL scene set, so this is the one place
+    that logic lives."""
     import asf_search as asf
 
     s1 = cfg["sentinel1"]
+    # CLI --orbit/--direction (see `python pipeline.py tracks`) take priority
+    # over the config file so picking a track never requires hand-editing
+    # YAML -- same "human picks via the next command's args" pattern as
+    # stage 7's reference point. Config values remain a valid fallback for
+    # runs (like pettimudi_repro.yaml) that pin a track permanently.
+    if orbit_override is not None:
+        s1 = {**s1, "relative_orbit": orbit_override}
+    if direction_override is not None:
+        s1 = {**s1, "flight_direction": direction_override}
     if s1.get("relative_orbit") is None or s1.get("flight_direction") is None:
         raise ValueError(
-            "sentinel1.relative_orbit and sentinel1.flight_direction must be set in the config "
-            "-- run `python pipeline.py tracks` first to find which tracks cover this AOI."
+            "sentinel1.relative_orbit and sentinel1.flight_direction must be set, either in the "
+            "config or via --orbit/--direction -- run `python pipeline.py tracks` first to find "
+            "which tracks cover this AOI."
         )
 
     wkt = _bbox_to_wkt(cfg["aoi"]["bbox"])
@@ -455,6 +536,15 @@ def stage1_search_download(cfg: dict, paths: Paths) -> list[str]:
     if not results:
         raise RuntimeError(f"No scenes match polarization={polarization} after filtering")
 
+    return results
+
+
+def stage1_search_download(cfg: dict, paths: Paths, orbit_override: int | None = None,
+                            direction_override: str | None = None) -> list[str]:
+    import asf_search as asf
+
+    results = _search_slc_scenes(cfg, orbit_override, direction_override)
+
     paths.slc.mkdir(parents=True, exist_ok=True)
     session = asf.ASFSession()  # picks up ~/.netrc automatically
 
@@ -486,14 +576,59 @@ def stage1_search_download(cfg: dict, paths: Paths) -> list[str]:
 # ============================================================
 # STAGE 2 -- DEM (Copernicus GLO-30, ellipsoidal height)
 # ============================================================
+def _footprint_bbox(cfg: dict) -> list[float] | None:
+    """Real DEM extent, derived from the actual satellite scene geometry --
+    not guessed. ISCE2's topo step needs DEM coverage across the real
+    illuminated footprint of the scenes actually being used (a diagonal
+    parallelogram, heading-dependent -- NOT a symmetric box around the AOI),
+    or it silently produces geometry artifacts rather than a loud error.
+    Confirmed directly on the Pettimudi validation (2026-08-10): a
+    symmetric 1.0deg AOI pad produced a specific patch with a spurious
+    coherence spike (temporal coherence 0.455 vs 0.309 in the immediately
+    surrounding area) that vanished once the DEM was replaced with one
+    covering the real scene footprint -- not real ground deformation, a
+    geometry-error artifact from under-coverage in that direction.
+    Returns None (caller falls back to AOI+padding_deg) if the scene search
+    can't be reached -- DEM generation shouldn't hard-fail on a transient
+    ASF outage."""
+    try:
+        results = _search_slc_scenes(cfg)
+    except Exception as e:
+        print(f"  [warn] could not fetch real scene footprints ({e}) -- "
+              f"falling back to AOI bbox + padding_deg for the DEM extent.")
+        return None
+    lons, lats = [], []
+    for r in results:
+        for ring in (r.geometry or {}).get("coordinates", []):
+            for lon, lat in ring:
+                lons.append(lon)
+                lats.append(lat)
+    if not lons:
+        return None
+    return [min(lons), min(lats), max(lons), max(lats)]
+
+
 def stage2_dem(cfg: dict, paths: Paths) -> None:
     import rasterio
     from dem_stitcher import stitch_dem
 
     def _do():
         lon_min, lat_min, lon_max, lat_max = cfg["aoi"]["bbox"]
+        # padding_deg is now a small safety margin added around the REAL
+        # scene footprint (not the sole driver of DEM extent) -- see
+        # _footprint_bbox. Falls back to AOI+padding_deg (the old
+        # behavior) only if the real footprint can't be fetched.
         pad = cfg["dem"]["padding_deg"]
-        bbox = [lon_min - pad, lat_min - pad, lon_max + pad, lat_max + pad]
+        footprint = _footprint_bbox(cfg)
+        if footprint is not None:
+            f_lon_min, f_lat_min, f_lon_max, f_lat_max = footprint
+            bbox = [f_lon_min - pad, f_lat_min - pad, f_lon_max + pad, f_lat_max + pad]
+            print(f"  DEM extent derived from real scene footprint (+{pad} deg margin): "
+                  f"lon [{bbox[0]:.4f}, {bbox[2]:.4f}]  lat [{bbox[1]:.4f}, {bbox[3]:.4f}]")
+        else:
+            bbox = [lon_min - pad, lat_min - pad, lon_max + pad, lat_max + pad]
+            print(f"  DEM extent from AOI bbox + padding_deg (footprint fallback): "
+                  f"lon [{bbox[0]:.4f}, {bbox[2]:.4f}]  lat [{bbox[1]:.4f}, {bbox[3]:.4f}]")
 
         # deliberately ellipsoidal (WGS84) height, not geoid -- a datum
         # mismatch here is a known way to get wildly wrong displacement values
@@ -1134,7 +1269,25 @@ if __name__ == "__main__":
     if stage_key == "tracks":
         config_path = extra_args[0] if extra_args else None
         cfg, paths = setup(config_path)
-        search_tracks(cfg)
+        search_tracks(cfg, paths)
+    elif stage_key == "1":
+        # --orbit/--direction let you pick a track (from `python pipeline.py
+        # tracks`) without hand-editing the config YAML -- may appear
+        # anywhere after the config path, e.g.:
+        #   python pipeline.py 1 configs/runs/my_aoi.yaml --orbit 165 --direction DESCENDING
+        positional, orbit_override, direction_override = [], None, None
+        i = 0
+        while i < len(extra_args):
+            arg = extra_args[i]
+            if arg == "--orbit":
+                orbit_override = int(extra_args[i + 1]); i += 2
+            elif arg == "--direction":
+                direction_override = extra_args[i + 1].upper(); i += 2
+            else:
+                positional.append(arg); i += 1
+        config_path = positional[0] if positional else None
+        cfg, paths = setup(config_path)
+        stage1_search_download(cfg, paths, orbit_override, direction_override)
     elif stage_key == "7":
         # BUG FIXED 2026-08-05: this used to call setup() with no config
         # path at all, meaning it silently ALWAYS used the default config

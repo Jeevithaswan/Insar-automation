@@ -1,0 +1,81 @@
+run_id: pettimudi_dem_swap
+# Controlled comparison test, NOT a genericity test: reuses Pettimudi's own
+# known-good scene/AOI/track through the NEW automated pipeline (instead of
+# the original manual terminal commands) to isolate one variable -- does the
+# automation layer itself add meaningful overhead versus the proven manual
+# run (18 bursts in ~18 min)? SLC/orbit files are reused from
+# ~/pettimudi_insar/ (pre-copied into this run's slc/ and orbits/ folders)
+# to skip re-downloading ~8GB and get straight to the comparison.
+aoi:
+  bbox: [76.861306, 10.021694, 77.161306, 10.321694]   # exact Pettimudi bbox
+date_range:
+  # Fixed 2026-08-05: was end="2020-05-18", which only captured 2 of the 6
+  # real acquisition dates. Confirmed directly from the actual ground-truth
+  # interferograms on disk (~/pettimudi_insar/stack_proc/merged/interferograms/):
+  # real dates are 20200319 (reference), 20200518, 20200623, 20200729,
+  # 20200810, 20200822. End date padded one day past the last real
+  # acquisition to avoid any inclusive/exclusive date-boundary edge case.
+  start: "2020-03-19"
+  end: "2020-08-23"
+sentinel1:
+  relative_orbit: 165        # confirmed via asf_search for this exact scene
+  flight_direction: DESCENDING
+  polarization: VV
+  # Fixed 2026-08-05: without this, the date_range above also picks up real
+  # scenes that exist in the archive but aren't part of the actual 6-date
+  # ground truth (confirmed live: a real 2020-07-17 scene started
+  # downloading before this was caught). Explicit whitelist guarantees
+  # exactly the dates being reproduced, regardless of what else ASF has.
+  include_dates: ["20200319", "20200518", "20200623", "20200729", "20200810", "20200822"]
+dem:
+  source: glo_30
+  padding_deg: 1.0            # new corrected default
+network:
+  # Fixed 2026-08-05: was connections=1 (a sparse 5-pair chain). Confirmed
+  # from the real ground-truth interferogram list that the manual analysis
+  # actually used connections=2 -- each date linked to its 2 nearest
+  # neighbors forward in time predicts exactly the 9 real pairs found on
+  # disk (0319-0518, 0319-0623, 0518-0623, 0518-0729, 0623-0729, 0623-0810,
+  # 0729-0810, 0729-0822, 0810-0822). connections=1 would silently
+  # reproduce a different, weaker network than what was actually analyzed.
+  connections: 2
+  # Fixed 2026-08-05: was azimuth_looks=7, range_looks=19 (copied blind from
+  # template.yaml's generic placeholder default). Confirmed via velocity.h5
+  # attrs (ALOOKS/RLOOKS) that the real manual run actually used 3x9 --
+  # geocoded raster was 1843x4991 there vs 790x2364 at 7x19. Different looks
+  # = different amount of pre-inversion spatial averaging = different
+  # velocity extremes and reliable-pixel count, even with identical
+  # reference point and MintPy recipe. Must match 3x9 for this comparison
+  # to be apples-to-apples.
+  azimuth_looks: 3
+  range_looks: 9
+  run16_parallelism: 1
+  num_proc: 1
+  num_proc4topo: 1
+# ISCE2's own docs: recommended for low-latitude/ascending data, but "only
+# works well in areas with high coherence" -- Pettimudi's own report notes
+# measured ~0.37 coherence here (low), so leaving this off matches both the
+# original manual analysis AND ISCE2's own guidance against using it in
+# low-coherence areas. Check stage 6's coherence readout to confirm before
+# changing this.
+ionosphere:
+  enabled: false
+  num_connections_ion: 3
+mintpy:
+  reference_lalo: null
+  reference_search_radius_km: 5.0
+  reliability_threshold: 0.5
+  unwrap_error_method: "bridging+phase_closure"
+  deramp: linear
+  # Fixed 2026-08-05: the real manual Pettimudi analysis DID use tropospheric
+  # correction (confirmed directly in ~/pettimudi_insar/mintpy/smallbaselineApp.cfg
+  # -- troposphericDelay.method = pyaps) and the report notes call atmospheric
+  # contamination a significant, explicitly-addressed finding. Leaving this
+  # false here would silently NOT reproduce the original methodology. Needs
+  # ~/.cdsapirc (already present on this machine) for the ERA5 download.
+  tropo_enabled: true
+  tropo_method: pyaps
+  tropo_weather_model: ERA5
+  topographic_residual: true
+output:
+  base_dir: "~/insar-automation/runs"

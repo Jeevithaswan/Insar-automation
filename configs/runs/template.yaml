@@ -1,0 +1,107 @@
+# Template for a NEW area of interest. Copy this file (don't edit it
+# directly), fill in the CHANGE_ME fields, then:
+#   1. python pipeline.py tracks configs/runs/your_file.yaml
+#      -> tells you which relative_orbit/flight_direction actually cover
+#         this AOI. Fill the result into sentinel1 below.
+#   2. python pipeline.py 0 configs/runs/your_file.yaml
+#      -> then 1, 2, 3, ... in order, same as any other run.
+#
+# Every value below is a portable default meant to work on any machine/AOI,
+# not tuned to one specific laptop or region -- see the comments on
+# padding_deg and topo_omp_threads in particular.
+
+run_id: CHANGE_ME
+aoi:
+  bbox: [0.0, 0.0, 0.0, 0.0]   # CHANGE_ME: [lon_min, lat_min, lon_max, lat_max]
+date_range:
+  start: "YYYY-MM-DD"   # CHANGE_ME
+  end: "YYYY-MM-DD"     # CHANGE_ME
+
+sentinel1:
+  relative_orbit: null      # CHANGE_ME -- run `python pipeline.py tracks` first to find this
+  flight_direction: null    # CHANGE_ME -- ASCENDING or DESCENDING
+  polarization: VV
+
+dem:
+  source: glo_30
+  # ISCE2's topo step needs DEM coverage across the REAL illuminated
+  # footprint of the scenes being used (a diagonal parallelogram, satellite
+  # heading-dependent), not a symmetric box guessed around the AOI -- a
+  # symmetric pad that's too small in the direction the swath actually
+  # extends won't crash topo (no loud error), it silently produces a
+  # geometry artifact instead: on the Pettimudi validation (2026-08-10), a
+  # 1.0 deg symmetric AOI pad left one specific patch with a spurious
+  # coherence spike (temporal coherence 0.455 vs 0.309 in the immediately
+  # surrounding area -- not real ground deformation) that vanished once the
+  # DEM covered the real scene footprint instead.
+  #
+  # Because of that, stage2_dem no longer pads the AOI bbox by default --
+  # it derives the DEM extent from the ACTUAL scene footprint geometry
+  # (the same ASF search stage 1 uses to download the scenes, re-run here
+  # to get their real geometry). padding_deg below is now just a small
+  # safety margin added around that real footprint, not the sole driver of
+  # coverage -- 1.0 degree is generous for that purpose. It's also the
+  # fallback bbox pad (AOI-centered, old behavior) for the rare case the
+  # scene search can't be reached when this stage runs. Cheap either way
+  # now that the DEM is converted to ISCE2's native uncompressed format
+  # (see stage2_dem; a compressed GeoTIFF made this step take hours instead
+  # of seconds).
+  padding_deg: 1.0
+
+network:
+  # each acquisition date paired with its N nearest neighbors in time.
+  # >=3 gives enough redundancy for triangles to exist, which
+  # mintpy.unwrapError phase_closure correction needs (see unwrap_error_method
+  # below) -- a bare minimum test with only 1-2 scenes can't form triangles
+  # at all, regardless of this setting.
+  connections: 3
+  # NOT a universal default -- this is a real resolution-vs-noise tradeoff
+  # you must decide per study, not copy blind (this bit us once: pettimudi_repro.yaml
+  # inherited this placeholder instead of matching the manual run's actual 3x9,
+  # which produced a different velocity range and reliable-pixel count even
+  # with an identical reference point and MintPy recipe -- see disk file
+  # docker_packaging notes / velocity comparison for that incident).
+  # Sentinel-1 IW raw pixel spacing is ~2.3m range x ~14.1m azimuth, so
+  # azimuth_looks*range_looks sets how many raw pixels get averaged into one
+  # output pixel: fewer looks = finer spatial detail but noisier per-pixel
+  # coherence; more looks = coarser but smoother/less noisy. Pick based on
+  # how fine a feature you need to resolve (e.g. a small landslide crown
+  # wants fewer looks) vs how low the raw coherence is in this AOI (very
+  # low coherence may need more looks just to get usable coherence at all --
+  # check stage 6's coherence readout before deciding).
+  azimuth_looks: 7
+  range_looks: 19
+  run16_parallelism: 1   # SNAPHU unwrapping is memory-heavy -- keep sequential unless you've confirmed spare RAM
+  num_proc: 1
+  num_proc4topo: 1
+  # null = auto (let OpenMP/ISCE2 pick the thread count) -- portable across
+  # any machine. Only hardcode a specific number if you've benchmarked THIS
+  # machine and confirmed a fixed count is faster (dummy_test_aoi.yaml pins
+  # 6 for one specific laptop's hybrid performance/efficiency-core CPU --
+  # that number is meaningless on different hardware).
+  topo_omp_threads: null
+
+# ISCE2's own docs: recommended for low-latitude/ascending data, but "only
+# works well in areas with high coherence" -- no universal on/off answer.
+# Run stage 6 first with this off, check the coherence readout it prints
+# for THIS AOI, then decide -- don't enable this blind before seeing data.
+ionosphere:
+  enabled: false
+  num_connections_ion: 3
+
+mintpy:
+  reference_lalo: null    # filled in by `python pipeline.py 7 <lat> <lon>`, after reviewing stage 6's candidates
+  reference_search_radius_km: 5.0
+  reliability_threshold: 0.5
+  # needs >=3 dates with overlapping pairs (triangles) to be applicable --
+  # for a minimal 2-scene/1-pair test, use "bridging" only instead (see
+  # dummy_test_aoi.yaml for that exact situation).
+  unwrap_error_method: "bridging+phase_closure"
+  deramp: linear
+  tropo_enabled: false     # true requires ~/.cdsapirc (CDS API key) for ERA5 -- see environment_gotchas
+  tropo_method: pyaps
+  tropo_weather_model: ERA5
+  topographic_residual: true
+
+output:
+  base_dir: "~/insar-automation/runs"
