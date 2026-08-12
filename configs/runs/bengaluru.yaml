@@ -1,0 +1,40 @@
+run_id: bengaluru
+aoi:
+  bbox:
+  - 77.45
+  - 12.85
+  - 77.75
+  - 13.15
+date_range:
+  start: '2021-04-01'   # narrowed from the original 2011-2021 (10yr/177-scene) range --
+  end: '2021-07-09'      # confirmed via real ASF search: 8 scenes, ~12 days apart, manageable test size
+sentinel1:
+  relative_orbit: 165        # confirmed via dashboard's Discover Tracks -- 177 scenes over the full
+  flight_direction: DESCENDING  # 10yr range, ample coverage; the ASCENDING track only had 2 scenes total
+  polarization: VV
+dem:
+  source: glo_30
+  padding_deg: 1.0
+network:
+  connections: 3
+  azimuth_looks: 7
+  range_looks: 19
+  run16_parallelism: 1
+  num_proc: 1
+  num_proc4topo: 1
+  topo_omp_threads: null
+ionosphere:
+  enabled: false
+  num_connections_ion: 3
+mintpy:
+  reference_lalo: null
+  reference_search_radius_km: 5.0
+  reliability_threshold: 0.5
+  unwrap_error_method: bridging+phase_closure
+  deramp: linear
+  tropo_enabled: false
+  tropo_method: pyaps
+  tropo_weather_model: ERA5
+  topographic_residual: true
+output:
+  base_dir: ~/insar-automation/runs
