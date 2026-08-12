@@ -5,6 +5,28 @@ interest, any date range, any track -- run one stage at a time from a plain
 terminal, or via Docker. Same tools used for a manual ISCE2/MintPy analysis,
 just called from code instead of by hand.
 
+## What this replaces
+
+A manual InSAR deformation analysis (Sentinel-1 SLC download through a final
+velocity/time-series map) previously meant a sequence of hand-typed ISCE2 and
+MintPy terminal commands, redone from scratch for every new area of interest.
+This pipeline takes the same tools and turns that into a config file (area,
+date range, track) plus one command per stage -- any AOI, not one hardcoded
+region.
+
+## Validated, not just built
+
+Rather than assume the automated output was correct, this pipeline's results
+were directly compared against a known-good manual ISCE2/MintPy analysis of a
+real event (a 2020 landslide). That comparison surfaced a real, non-obvious
+bug -- the DEM extent generation was silently under-covering the satellite's
+actual imaging footprint in some directions, producing a measurable false
+signal (a spurious coherence spike) in one region of the output. Root-caused
+via a controlled before/after test, then fixed generally (derives DEM extent
+from the real satellite footprint geometry now, not a guessed pad) so it
+doesn't recur on the next area -- see the "Fix DEM extent" commit for the
+full writeup.
+
 Stages: search/download Sentinel-1 SLCs (ASF) → DEM (Copernicus GLO-30) →
 orbit files → ISCE2 stack setup/execution → MintPy time series → deliverables
 (velocity map, time series plots, CSV, KMZ).
